@@ -1,0 +1,13 @@
+[project]
+name = "speach-to-text"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "av<14",
+    "faster-whisper>=1.2.1",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "nvidia-cudnn-cu12>=9.27.0.42",
+    "opencc-python-reimplemented>=0.1.7",
+]
