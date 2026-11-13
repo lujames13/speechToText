@@ -1,10 +1,11 @@
 """Transcribe an interview recording and turn it into a speaker-labelled Q&A script.
 
-Pipeline: faster-whisper (GPU) -> timestamped raw .txt -> Gemini -> Q&A .md.
+Pipeline: WhisperX (GPU: transcribe -> align -> pyannote diarization)
+-> output/raw/<stem>.segments.json (+ .txt view) -> Gemini -> Q&A .md.
 
-    uv run transcribe.py records/foo.mp3              # STT + Q&A (asks for JD)
-    uv run transcribe.py records/foo.mp3 --no-llm     # STT only (old behaviour)
-    uv run transcribe.py --from-raw output/foo_*.txt  # skip STT, LLM step only
+    uv run transcribe.py records/foo.mp3                    # STT + Q&A (asks for JD)
+    uv run transcribe.py records/foo.mp3 --no-llm --speakers 2   # STT only
+    uv run transcribe.py --from-raw output/raw/foo.segments.json # LLM step only
 
 Forces GPU execution on the RTX 4070 (device="cuda", compute_type="float16",
 model="large-v3").
@@ -12,6 +13,7 @@ model="large-v3").
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -19,15 +21,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+import time
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
 
 OUTPUT_DIR = Path("output")
+RAW_DIR = OUTPUT_DIR / "raw"
 CLEANED_DIR = OUTPUT_DIR / "cleaned"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+SEGMENTS_SUFFIX = ".segments.json"
 MODEL_SIZE = "large-v3"
+LANGUAGE = "zh"
 INITIAL_PROMPT = "以下是繁體中文的對話逐字稿，包含常見的標點符號。"
+# Lower to 8 via env if the 12 GB card runs out of memory during transcription.
+BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", 16))
+# whisperx 3.8.6's DiarizationPipeline default; passed explicitly so the
+# preflight access check and the actual load use the same repo.
+DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
+# Gated sub-models a pipeline loads, so the preflight catches them too.
+# pyannote-audio 4's SpeakerDiarization defaults its PLDA to community-1 and
+# the 3.1 config doesn't override it, so community-1 is needed in every case.
+DIARIZE_EXTRA_REPOS = {"pyannote/speaker-diarization-3.1": ("pyannote/segmentation-3.0",)}
 
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 # Step A rewrites the whole transcript, so the output limit (not the input) is
@@ -39,7 +55,10 @@ PREV_TAIL_CHARS = 3000  # tail of the previous chunk's output, for speaker state
 
 JD_MARKER = "----- 以下貼上 JD -----"
 
-SEGMENT_RE =re.compile(r"^\[(\d+(?:\.\d+)?) --> (\d+(?:\.\d+)?)\] (.*)$")
+# Legacy raw line: '[00007.00 --> 00009.00] text'.
+SEGMENT_RE = re.compile(r"^\[(\d+(?:\.\d+)?) --> (\d+(?:\.\d+)?)\] (.*)$")
+# Human-readable view line with a speaker: '[00007.00 --> 00009.00] SPEAKER_00: text'.
+VIEW_SPEAKER_RE = re.compile(r"^\[\d+(?:\.\d+)? --> \d+(?:\.\d+)?\] SPEAKER_\w+: ")
 
 
 @dataclass
@@ -50,18 +69,50 @@ class InterviewMeta:
     jd: str
 
 
+@dataclass
+class Segment:
+    id: int
+    start: float
+    end: float
+    speaker: str | None
+    text: str
+
+
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("必須是 >= 1 的整數")
+    return n
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("audio", nargs="?", type=Path, help="錄音檔路徑")
     parser.add_argument("--no-llm", action="store_true", help="只做 STT，不呼叫 LLM、不問任何輸入")
-    parser.add_argument("--from-raw", type=Path, metavar="PATH", help="跳過 STT，直接用既有逐字稿")
+    parser.add_argument(
+        "--from-raw", type=Path, metavar="PATH",
+        help=f"跳過 STT，直接用既有逐字稿（{SEGMENTS_SUFFIX}，或舊版 [start --> end] .txt）",
+    )
     parser.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD", help="面試日期")
+    parser.add_argument(
+        "--speakers", type=_positive_int, metavar="N",
+        help="說話者人數（預設由 pyannote 自行判斷）",
+    )
+    parser.add_argument("--no-diarize", action="store_true", help="不做說話者分離（不需要 HF_TOKEN）")
+    parser.add_argument(
+        "--diarize-model", metavar="HF_REPO",
+        help="pyannote 模型（預設用 whisperx 的預設值；例：pyannote/speaker-diarization-3.1）",
+    )
     args = parser.parse_args(argv)
 
     if args.from_raw and args.no_llm:
         parser.error("--no-llm 與 --from-raw 不能同時使用（兩者都沒有事可做）")
     if args.from_raw and args.audio:
         parser.error("--from-raw 不需要 audio 參數")
+    if args.from_raw and (args.speakers or args.no_diarize or args.diarize_model):
+        parser.error("--from-raw 會跳過 STT，不能搭配 --speakers / --no-diarize / --diarize-model")
+    if args.no_diarize and (args.speakers or args.diarize_model):
+        parser.error("--no-diarize 不能搭配 --speakers / --diarize-model")
     if not args.from_raw and not args.audio:
         parser.error("請提供錄音檔路徑，或用 --from-raw 指定既有逐字稿")
     if args.audio and not args.audio.is_file():
@@ -85,9 +136,11 @@ def configure_cuda_library_path() -> None:
     """Point the dynamic loader at the pip-installed cuBLAS/cuDNN .so files.
 
     No system CUDA toolkit is installed in this WSL2 environment, so
-    ctranslate2 (faster-whisper's backend) must load the CUDA runtime
-    libraries shipped inside the nvidia-cublas-cu12 / nvidia-cudnn-cu12
-    wheels instead. glibc's dynamic loader only reads LD_LIBRARY_PATH when
+    ctranslate2 (faster-whisper's backend, used by WhisperX) must load the
+    CUDA runtime libraries shipped inside the nvidia-cublas-cu12 /
+    nvidia-cudnn-cu12 wheels instead. Those wheels are now pulled in by torch
+    (exact pins), so torch and ctranslate2 share one copy. glibc's dynamic
+    loader only reads LD_LIBRARY_PATH when
     a process starts, so setting os.environ from inside the already-running
     interpreter has no effect on later dlopen() calls. We re-exec this same
     script once with the corrected environment to work around that.
@@ -133,7 +186,7 @@ def check_gpu_environment() -> None:
         sys.exit(
             "缺少 CUDA 執行所需的函式庫: "
             + ", ".join(missing)
-            + "\n請執行: uv add nvidia-cublas-cu12 nvidia-cudnn-cu12"
+            + "\n這些由 torch 帶入，請執行: uv sync"
         )
     print("cuBLAS / cuDNN (pip 套件) 可用。")
     print()
@@ -142,36 +195,233 @@ def check_gpu_environment() -> None:
 # --- STT --------------------------------------------------------------------
 
 
-def transcribe_file(audio_path: Path) -> Path:
-    """Run Whisper on one file and write the timestamped raw transcript."""
-    from faster_whisper import WhisperModel
+def check_diarize_access(model_name: str, token: str) -> None:
+    """Fail fast on gated-model 401/403 before spending an hour on STT.
+
+    Network errors only warn: the models may already be in the local cache.
+    """
+    from huggingface_hub import auth_check
+    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
+
+    repos = dict.fromkeys(
+        (model_name, *DIARIZE_EXTRA_REPOS.get(model_name, ()), DEFAULT_DIARIZE_MODEL)
+    )
+    for repo in repos:
+        try:
+            auth_check(repo, token=token)
+        except GatedRepoError:
+            sys.exit(
+                f"HF_TOKEN 沒有 {repo} 的存取權（gated model）。\n"
+                f"請登入 Hugging Face 後到 https://huggingface.co/{repo} 同意使用條款，再重跑。"
+            )
+        except RepositoryNotFoundError:
+            sys.exit(f"找不到 {repo}，或 HF_TOKEN 無效。請檢查 --diarize-model 與 HF_TOKEN。")
+        except (HfHubHTTPError, OSError) as e:
+            print(f"警告：無法確認 {repo} 的存取權（{type(e).__name__}），若模型已快取則可繼續。")
+
+
+@contextmanager
+def stage(name: str):
+    """Print wall time for one pipeline stage."""
+    print(f"[{name}] 開始...")
+    t0 = time.perf_counter()
+    yield
+    print(f"[{name}] 完成，耗時 {time.perf_counter() - t0:.1f} 秒")
+
+
+def _free_gpu() -> None:
+    """Call after `del`-ing the last reference to a model, before the next stage."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _speaker_kwargs(speakers: int | None) -> dict[str, int]:
+    if speakers is None:
+        return {}
+    return {"min_speakers": speakers, "max_speakers": speakers}
+
+
+def run_whisperx(
+    audio_path: Path,
+    speakers: int | None = None,
+    diarize: bool = True,
+    diarize_model: str | None = None,
+) -> list[Segment]:
+    """Transcribe, align and (optionally) diarize one file on the GPU."""
+    import whisperx
+    from faster_whisper.audio import decode_audio
     from opencc import OpenCC
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    converter = OpenCC("s2twp")  # Simplified -> Traditional (Taiwan, with phrases)
+    device = "cuda"
 
-    print(f"載入模型 {MODEL_SIZE}（device=cuda, compute_type=float16）...")
-    model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+    with stage("load"):
+        # whisperx.load_audio shells out to the ffmpeg CLI; PyAV (bundled
+        # ffmpeg, via faster-whisper) gives the same 16 kHz float32 mono array
+        # without a system package.
+        audio = decode_audio(str(audio_path), sampling_rate=16000)
+        print(f"音訊長度 {len(audio) / 16000 / 60:.1f} 分鐘")
+        print(f"載入模型 {MODEL_SIZE}（device={device}, compute_type=float16, batch_size={BATCH_SIZE}）")
+        model = whisperx.load_model(
+            MODEL_SIZE,
+            device,
+            compute_type="float16",
+            language=LANGUAGE,
+            asr_options={"initial_prompt": INITIAL_PROMPT},
+        )
 
-    print(f"轉錄中: {audio_path.name}")
-    segments, info = model.transcribe(
-        str(audio_path),
-        language="zh",
-        initial_prompt=INITIAL_PROMPT,
-    )
+    with stage("transcribe"):
+        result = model.transcribe(audio, batch_size=BATCH_SIZE, language=LANGUAGE)
+        del model
+        _free_gpu()
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = OUTPUT_DIR / f"{audio_path.stem}_{timestamp}.txt"
+    with stage("align"):
+        align_model, align_meta = whisperx.load_align_model(language_code=LANGUAGE, device=device)
+        result = whisperx.align(
+            result["segments"], align_model, align_meta, audio, device,
+            return_char_alignments=False,
+        )
+        del align_model
+        _free_gpu()
 
-    with out_path.open("w", encoding="utf-8") as f:
-        for segment in segments:
-            text = converter.convert(segment.text.strip())
-            start = f"{segment.start:08.2f}"
-            end = f"{segment.end:08.2f}"
-            f.write(f"[{start} --> {end}] {text}\n")
+    if diarize:
+        from whisperx.diarize import DiarizationPipeline
 
-    print(f"已輸出: {out_path}")
-    return out_path
+        with stage("diarize"):
+            pipeline = DiarizationPipeline(
+                model_name=diarize_model or DEFAULT_DIARIZE_MODEL,
+                token=os.environ["HF_TOKEN"],
+                device=device,
+            )
+            diarize_df = pipeline(audio, **_speaker_kwargs(speakers))
+            result = whisperx.assign_word_speakers(diarize_df, result, fill_nearest=True)
+            del pipeline
+            _free_gpu()
+
+    return build_segments(result["segments"], OpenCC("s2twp"))
+
+
+def build_segments(raw_segments: list[dict], converter) -> list[Segment]:
+    """WhisperX segment dicts -> numbered Segments in Traditional Chinese.
+
+    Empty text is dropped. A missing start falls back to the previous end
+    (0.0 at the beginning); a missing end falls back to start. No text is
+    ever dropped for lack of a timestamp.
+    """
+    segments: list[Segment] = []
+    prev_end = 0.0
+    for raw in raw_segments:
+        text = converter.convert((raw.get("text") or "").strip())
+        if not text:
+            continue
+        start = raw.get("start")
+        start = prev_end if start is None else float(start)
+        end = raw.get("end")
+        end = start if end is None else float(end)
+        segments.append(
+            Segment(
+                id=len(segments),
+                start=round(start, 2),
+                end=round(end, 2),
+                speaker=raw.get("speaker"),
+                text=text,
+            )
+        )
+        prev_end = end
+    return segments
+
+
+def _raw_stem(path: Path) -> str:
+    """'foo.segments.json' -> 'foo'; anything else -> path.stem."""
+    if path.name.endswith(SEGMENTS_SUFFIX):
+        return path.name[: -len(SEGMENTS_SUFFIX)]
+    return path.stem
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+def segments_view(segments: list[Segment]) -> str:
+    """Human-readable view. Never parsed back; the JSON is canonical."""
+    lines = []
+    for s in segments:
+        who = f"{s.speaker}: " if s.speaker else ""
+        lines.append(f"[{s.start:08.2f} --> {s.end:08.2f}] {who}{s.text}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def write_segments(segments: list[Segment], stem: str) -> tuple[Path, Path]:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = RAW_DIR / f"{stem}{SEGMENTS_SUFFIX}"
+    txt_path = RAW_DIR / f"{stem}.txt"
+    payload = json.dumps([asdict(s) for s in segments], ensure_ascii=False, indent=2)
+    _atomic_write(json_path, payload + "\n")
+    _atomic_write(txt_path, segments_view(segments))
+    return json_path, txt_path
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _load_segments_json(path: Path) -> list[Segment]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        sys.exit(f"{path} 不是合法的 JSON: {e}")
+    if not isinstance(data, list):
+        sys.exit(f"{path} 格式錯誤：最外層必須是 list。")
+
+    segments = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            sys.exit(f"{path} 第 {i} 筆格式錯誤：必須是 object。")
+        missing = [k for k in ("id", "start", "end", "speaker", "text") if k not in item]
+        if missing:
+            sys.exit(f"{path} 第 {i} 筆缺少欄位: {', '.join(missing)}")
+        if not (
+            isinstance(item["id"], int) and not isinstance(item["id"], bool)
+            and _is_number(item["start"])
+            and _is_number(item["end"])
+            and (item["speaker"] is None or isinstance(item["speaker"], str))
+            and isinstance(item["text"], str)
+        ):
+            sys.exit(f"{path} 第 {i} 筆欄位型別錯誤（id:int, start/end:number, speaker:str|null, text:str）")
+        segments.append(
+            Segment(item["id"], float(item["start"]), float(item["end"]), item["speaker"], item["text"])
+        )
+    return segments
+
+
+def _load_segments_legacy_txt(path: Path) -> list[Segment]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if any(VIEW_SPEAKER_RE.match(line) for line in lines):
+        json_path = path.with_name(f"{path.stem}{SEGMENTS_SUFFIX}")
+        sys.exit(
+            f"{path} 是帶說話者的檢視用 .txt，不能當輸入。請改用 --from-raw {json_path}"
+        )
+    segments = []
+    for line in lines:
+        m = SEGMENT_RE.match(line)
+        if m:
+            segments.append(
+                Segment(len(segments), float(m.group(1)), float(m.group(2)), None, m.group(3))
+            )
+    return segments
+
+
+def load_segments(path: Path) -> list[Segment]:
+    if path.name.endswith(".json"):
+        return _load_segments_json(path)
+    if path.suffix == ".txt":
+        return _load_segments_legacy_txt(path)
+    sys.exit(f"不支援的逐字稿格式: {path}（需為 {SEGMENTS_SUFFIX} 或舊版 .txt）")
 
 
 # --- Interactive input ------------------------------------------------------
@@ -296,14 +546,9 @@ def _fmt_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _segment_lines(raw_text: str) -> list[str]:
-    """Raw '[00007.00 --> 00009.00] text' lines -> compact '[00:07] text' lines."""
-    out = []
-    for line in raw_text.splitlines():
-        m = SEGMENT_RE.match(line)
-        if m:
-            out.append(f"[{_fmt_ts(float(m.group(1)))}] {m.group(3)}")
-    return out
+def segments_to_lines(segments: list[Segment]) -> list[str]:
+    """Segments -> compact '[00:07] text' lines for Step A (no speaker labels; see #5)."""
+    return [f"[{_fmt_ts(s.start)}] {s.text}" for s in segments]
 
 
 def _user_prompt(
@@ -360,11 +605,10 @@ def _call_step_a(system: str, user: str) -> LlmResult:
     return call_llm(system, user, thinking_level="medium")
 
 
-def build_qa_transcript(raw_text: str, meta: InterviewMeta) -> str:
+def build_qa_transcript(lines: list[str], meta: InterviewMeta) -> str:
     system = (PROMPTS_DIR / "qa_transcript.md").read_text(encoding="utf-8")
-    lines = _segment_lines(raw_text)
     if not lines:
-        sys.exit("逐字稿中沒有可解析的 '[start --> end] text' 行。")
+        sys.exit("逐字稿中沒有可用的段落。")
 
     user = _user_prompt(meta, lines)
     tokens = count_llm_tokens(system + user)
@@ -380,7 +624,7 @@ def build_qa_transcript(raw_text: str, meta: InterviewMeta) -> str:
 
 def write_qa_file(raw_path: Path, meta: InterviewMeta, body: str) -> Path:
     CLEANED_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = CLEANED_DIR / f"{raw_path.stem}_qa.md"
+    out_path = CLEANED_DIR / f"{_raw_stem(raw_path)}_qa.md"
     header = f"# {meta.company} {meta.round}（{meta.date.isoformat()}）面試問答整理\n\n"
     out_path.write_text(header + body + "\n", encoding="utf-8")
     return out_path
@@ -398,6 +642,13 @@ def main() -> None:
 
     if use_llm and not os.environ.get("GEMINI_API_KEY"):
         sys.exit("缺少 GEMINI_API_KEY（可寫在 .env，範例見 .env.example）。")
+    if args.audio and not args.no_diarize and not os.environ.get("HF_TOKEN"):
+        sys.exit(
+            "缺少 HF_TOKEN（說話者分離需要；可寫在 .env，範例見 .env.example，"
+            "申請方式見 README）。或加 --no-diarize 略過說話者分離。"
+        )
+    if args.audio and not args.no_diarize:
+        check_diarize_access(args.diarize_model or DEFAULT_DIARIZE_MODEL, os.environ["HF_TOKEN"])
 
     if args.audio:
         check_gpu_environment()
@@ -410,11 +661,27 @@ def main() -> None:
         )
         meta = prompt_meta(args.date or default_date)
 
-    raw_path = args.from_raw or transcribe_file(args.audio)
+    if args.from_raw:
+        raw_path = args.from_raw
+        segments = load_segments(raw_path)
+    else:
+        total_t0 = time.perf_counter()
+        segments = run_whisperx(
+            args.audio,
+            speakers=args.speakers,
+            diarize=not args.no_diarize,
+            diarize_model=args.diarize_model,
+        )
+        with stage("write"):
+            raw_path, view_path = write_segments(segments, args.audio.stem)
+        speakers = sorted({s.speaker or "（無）" for s in segments})
+        print(f"已輸出: {raw_path}（{len(segments)} 段；說話者: {', '.join(speakers)}）")
+        print(f"檢視用: {view_path}")
+        print(f"STT 總耗時 {time.perf_counter() - total_t0:.1f} 秒")
     if not use_llm:
         return
 
-    body = build_qa_transcript(raw_path.read_text(encoding="utf-8"), meta)
+    body = build_qa_transcript(segments_to_lines(segments), meta)
     print(f"已輸出: {write_qa_file(raw_path, meta, body)}")
 
 

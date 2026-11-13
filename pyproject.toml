@@ -8,8 +8,16 @@ dependencies = [
     "av<14",
     "faster-whisper>=1.2.1",
     "google-genai>=2.34.0",
-    "nvidia-cublas-cu12>=12.9.2.10",
-    "nvidia-cudnn-cu12>=9.27.0.42",
     "opencc-python-reimplemented>=0.1.7",
     "python-dotenv>=1.2.4",
+    "whisperx==3.8.6",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

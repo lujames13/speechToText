@@ -4,3 +4,6 @@ output/
 __pycache__/
 *.pyc
 .env
+*.m4a
+*.mp3
+*.wav
