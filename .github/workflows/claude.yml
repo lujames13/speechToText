@@ -47,4 +47,37 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr *)'
+          # Bare names on purpose: domain-scoped forms don't clear the action's
+          # default web-tool disable (anthropics/claude-code-action#690).
+          claude_args: '--allowedTools "WebSearch,WebFetch"'
+
+      - name: Notify reviewer bot
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          GROK_WEBHOOK_URL: ${{ secrets.GROK_WEBHOOK_URL }}
+          GROK_WEBHOOK_SECRET: ${{ secrets.GROK_WEBHOOK_SECRET }}
+        run: |
+          if [ -z "$GROK_WEBHOOK_URL" ] || [ -z "$GROK_WEBHOOK_SECRET" ]; then
+            echo "::warning::webhook secrets not set, skipping notify"; exit 0
+          fi
+          ID=$(gh api --paginate "repos/$REPO/issues/$NUMBER/comments" \
+                 --jq '.[] | select(.user.login=="claude[bot]") | .id' | tail -1)
+          STATUS=unknown
+          if [ -n "$ID" ]; then
+            BODY=$(gh api "repos/$REPO/issues/comments/$ID" --jq .body)
+            STATUS=$(printf '%s' "$BODY" | grep -oP '<!-- agent-status: \K[a-z-]+' | tail -1 || true)
+            STATUS=${STATUS:-unknown}
+          fi
+          [ "$OUTCOME" != "success" ] && STATUS=run-failed
+          PAYLOAD=$(jq -n --arg repo "$REPO" --arg issue "$NUMBER" --arg status "$STATUS" \
+                          --arg comment_id "${ID:-}" --arg run_id "$GITHUB_RUN_ID" \
+                          '{repo:$repo, issue:$issue, status:$status, comment_id:$comment_id, run_id:$run_id}')
+          curl -fsS -X POST "$GROK_WEBHOOK_URL" \
+               -H "Authorization: Bearer $GROK_WEBHOOK_SECRET" \
+               -H "Content-Type: application/json" -d "$PAYLOAD" \
+            || echo "::warning::webhook notify failed"
 
