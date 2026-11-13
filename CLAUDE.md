@@ -26,8 +26,10 @@ done criteria; if something outside scope looks necessary, ask instead.
   needed, describe the exact diff in your report and the reviewer bot applies it.
 
 ## Reporting protocol
-Every comment that ends a run must end with exactly one status marker on its
-own line, after human-readable prose explaining it:
+Every comment that ends a run, including plan-only runs, must end with exactly
+one status marker as its final line, after human-readable prose explaining it.
+Nothing may follow the marker (no signature, no trailing links, no job-run
+link). A run that ends without a marker counts as a protocol violation.
 
 - `<!-- agent-status: plan-ready -->`: for every new issue, first post a plan
   (approach, files to touch, how you'll validate, risks/open questions) and
