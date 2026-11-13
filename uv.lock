@@ -3124,6 +3124,8 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "huggingface-hub" },
+    { name = "opencc-python-reimplemented" },
     { name = "pytest" },
 ]
 
@@ -3138,7 +3140,11 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.2.0" }]
+dev = [
+    { name = "huggingface-hub", specifier = ">=0.36.2" },
+    { name = "opencc-python-reimplemented", specifier = ">=0.1.7" },
+    { name = "pytest", specifier = ">=9.2.0" },
+]
 
 [[package]]
 name = "sqlalchemy"
