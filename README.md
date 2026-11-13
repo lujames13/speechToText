@@ -84,7 +84,7 @@ uv run transcribe.py --from-raw output/raw/interview.segments.json
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
 | `HF_TOKEN` | — | 說話者分離必要 |
-| `WHISPERX_BATCH_SIZE` | `16` | 轉錄批次大小。顯示卡記憶體不足（CUDA OOM）時改成 `8` |
+| `WHISPERX_BATCH_SIZE` | `8` | 轉錄批次大小。記憶體不足（CUDA OOM）時改成 `4`；顯示卡空閒時可改成 `16`，轉錄會比較快 |
 | `GEMINI_API_KEY` | — | 只有 Gemini 步驟需要 |
 
 第一次執行會從 Hugging Face 下載模型並快取在 `~/.cache/huggingface`：`large-v3`（約 3 GB）、中文對齊模型 `jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn`（約 1.2 GB）、pyannote 分離模型。下載的只有模型，音訊不會上傳；之後的執行可以離線。
@@ -108,13 +108,14 @@ output/cleaned/<檔名>_qa.md       # Gemini 問答稿（沒加 --no-llm 時）
 - `start` 與 `end` 以秒為單位，取到小數 2 位
 - `text` 經 OpenCC `s2twp` 轉成台灣繁體
 - `speaker` 是 pyannote 的標籤（`SPEAKER_00`、`SPEAKER_01`…）；用 `--no-diarize` 時為 `null`。標籤不代表誰是面試官，角色對應不在這一步處理。
+- 有做說話者分離時，每一段都只有一位說話者：Whisper 的段落會在逐字的說話者改變處切開。短於 0.5 秒、夾在同一位說話者中間的片段，視為對齊誤差，併回前後段。
 
 執行時會印出各階段（load、transcribe、align、diarize、write）的耗時。
 
 ## 疑難排解
 
 - **`HF_TOKEN 沒有 ... 的存取權`**：到訊息中的網址同意使用條款，再重跑。
-- **CUDA out of memory**：`WHISPERX_BATCH_SIZE=8 uv run transcribe.py ...`
+- **CUDA out of memory**：`WHISPERX_BATCH_SIZE=4 uv run transcribe.py ...`
 - **啟動時出現 `torchcodec is not installed correctly` 警告**：這是因為系統沒有裝 ffmpeg 函式庫，可以忽略；本程式自行解碼音訊，不經過 torchcodec。
 - **`libcudnn` / `libcublas` 找不到**：執行 `uv sync`。程式啟動時會把 pip 套件內的 CUDA 函式庫加到 `LD_LIBRARY_PATH` 並自動重新啟動一次。
 

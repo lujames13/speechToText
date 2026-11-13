@@ -83,6 +83,82 @@ def test_build_segments_missing_timestamps_fall_back_without_dropping_text():
     assert (segs[2].start, segs[2].end) == (5.0, 5.0)
 
 
+# --- split_by_speaker -------------------------------------------------------
+
+
+def _words(spec: str, start: float = 0.0, step: float = 0.2) -> list[dict]:
+    """'AAB' -> one char-word per letter, speaker SPEAKER_A / SPEAKER_B, 0.2 s each."""
+    words = []
+    for i, c in enumerate(spec):
+        t = start + i * step
+        words.append({"word": f"字{i}", "start": t, "end": t + step, "speaker": f"SPEAKER_{c}"})
+    return words
+
+
+def test_split_cuts_on_speaker_change():
+    seg = {"start": 0.0, "end": 2.0, "text": "x", "speaker": "SPEAKER_A", "words": _words("AAAAABBBBB")}
+    out = transcribe.split_by_speaker([seg])
+    assert [(s["speaker"], s["start"], round(s["end"], 2)) for s in out] == [
+        ("SPEAKER_A", 0.0, 1.0),
+        ("SPEAKER_B", 1.0, 2.0),
+    ]
+    assert out[0]["text"] == "字0字1字2字3字4"
+
+
+def test_split_merges_short_flicker():
+    # B lasts 0.2 s between two A runs -> jitter, merged into A.
+    seg = {"words": _words("AAAABAAAA"), "speaker": "SPEAKER_A"}
+    out = transcribe.split_by_speaker([seg])
+    assert len(out) == 1 and out[0]["speaker"] == "SPEAKER_A"
+    assert out[0]["text"].count("字") == 9
+
+
+def test_split_keeps_real_interjection():
+    # B lasts 0.6 s (>= 0.5) -> a real turn, kept.
+    seg = {"words": _words("AAAABBBAAAA")}
+    out = transcribe.split_by_speaker([seg])
+    assert [s["speaker"] for s in out] == ["SPEAKER_A", "SPEAKER_B", "SPEAKER_A"]
+
+
+def test_split_short_run_at_edge_is_kept():
+    # Not sandwiched: a short trailing B run is a genuine change.
+    out = transcribe.split_by_speaker([{"words": _words("AAAAB")}])
+    assert [s["speaker"] for s in out] == ["SPEAKER_A", "SPEAKER_B"]
+
+
+def test_split_words_without_speaker_or_timing_inherit():
+    words = [
+        {"word": "？"},  # leading, no speaker/timing -> first known speaker
+        {"word": "好", "start": 0.0, "end": 0.6, "speaker": "SPEAKER_A"},
+        {"word": "。"},  # no speaker -> stays with A
+        {"word": "對", "start": 1.0, "end": 1.8, "speaker": "SPEAKER_B"},
+    ]
+    out = transcribe.split_by_speaker([{"words": words}])
+    assert [(s["speaker"], s["text"]) for s in out] == [("SPEAKER_A", "？好。"), ("SPEAKER_B", "對")]
+    assert (out[0]["start"], out[0]["end"]) == (0.0, 0.6)
+
+
+def test_split_output_feeds_build_segments():
+    words = [
+        {"word": "甲", "start": 0.0, "end": 1.0, "speaker": "SPEAKER_A"},
+        {"word": "乙", "start": 1.0, "end": 2.0, "speaker": "SPEAKER_B"},
+    ]
+    out = transcribe.split_by_speaker([{"words": words}])
+    segs = build_segments(out, IdentityConverter())
+    assert [(s.id, s.speaker, s.text) for s in segs] == [(0, "SPEAKER_A", "甲"), (1, "SPEAKER_B", "乙")]
+
+
+def test_split_segment_without_words_passes_through():
+    seg = {"start": 1.0, "end": 2.0, "text": "無對齊", "speaker": "SPEAKER_A"}
+    assert transcribe.split_by_speaker([seg]) == [seg]
+
+
+def test_split_keeps_space_between_latin_words():
+    words = [{"word": w, "start": i, "end": i + 1, "speaker": "SPEAKER_A"}
+             for i, w in enumerate(["我", "用", "React", "and", "Vue", "。"])]
+    assert transcribe.split_by_speaker([{"words": words}])[0]["text"] == "我用React and Vue。"
+
+
 # --- write_segments ---------------------------------------------------------
 
 

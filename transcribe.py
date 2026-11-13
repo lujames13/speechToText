@@ -35,8 +35,12 @@ SEGMENTS_SUFFIX = ".segments.json"
 MODEL_SIZE = "large-v3"
 LANGUAGE = "zh"
 INITIAL_PROMPT = "以下是繁體中文的對話逐字稿，包含常見的標點符號。"
-# Lower to 8 via env if the 12 GB card runs out of memory during transcription.
-BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", 16))
+# 16 peaked at ~11.8 of 12 GB on the 4070 with an 83 min recording; 8 leaves
+# headroom. Override via env (lower on OOM, higher if VRAM is free).
+BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", 8))
+# Speaker runs shorter than this, sandwiched by the same other speaker, are
+# treated as alignment jitter and merged back (see split_by_speaker).
+MIN_TURN_SECONDS = 0.5
 # whisperx 3.8.6's DiarizationPipeline default; passed explicitly so the
 # preflight access check and the actual load use the same repo.
 DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
@@ -301,7 +305,77 @@ def run_whisperx(
             del pipeline
             _free_gpu()
 
-    return build_segments(result["segments"], OpenCC("s2twp"))
+    raw_segments = split_by_speaker(result["segments"]) if diarize else result["segments"]
+    if diarize:
+        print(f"依說話者切分：{len(result['segments'])} 段 → {len(raw_segments)} 段")
+    return build_segments(raw_segments, OpenCC("s2twp"))
+
+
+def _join_chars(chars: list[str]) -> str:
+    """Join zh 'words' (single characters), keeping a space between Latin words."""
+    out = ""
+    for c in chars:
+        if out and out[-1].isascii() and out[-1].isalnum() and c[:1].isascii() and c[:1].isalnum():
+            out += " "
+        out += c
+    return out
+
+
+def _run_duration(words: list[dict]) -> float:
+    starts = [w["start"] for w in words if w.get("start") is not None]
+    ends = [w["end"] for w in words if w.get("end") is not None]
+    return max(ends) - min(starts) if starts and ends else 0.0
+
+
+def split_by_speaker(raw_segments: list[dict], min_turn: float = MIN_TURN_SECONDS) -> list[dict]:
+    """Split aligned WhisperX segments wherever the word-level speaker changes.
+
+    assign_word_speakers labels a whole segment by majority overlap, so a
+    ~20 s segment spanning a question and the start of the answer gets one
+    label. Every word (a single character for zh) carries its own speaker, so
+    we cut on those instead. Words without a speaker (unalignable characters)
+    inherit the current run's speaker. A run shorter than `min_turn` seconds
+    sandwiched between two runs of the same other speaker is alignment jitter
+    and is merged back (A-B-A -> A).
+    """
+    out: list[dict] = []
+    for seg in raw_segments:
+        words = [w for w in seg.get("words") or [] if (w.get("word") or "").strip()]
+        if not words:
+            out.append({k: seg.get(k) for k in ("start", "end", "text", "speaker")})
+            continue
+
+        fallback = next((w["speaker"] for w in words if w.get("speaker")), seg.get("speaker"))
+        runs: list[tuple[str | None, list[dict]]] = []
+        current = fallback
+        for w in words:
+            current = w.get("speaker") or current
+            if runs and runs[-1][0] == current:
+                runs[-1][1].append(w)
+            else:
+                runs.append((current, [w]))
+
+        i = 1
+        while i < len(runs) - 1:
+            prev, mid, nxt = runs[i - 1], runs[i], runs[i + 1]
+            if prev[0] == nxt[0] != mid[0] and _run_duration(mid[1]) < min_turn:
+                runs[i - 1 : i + 2] = [(prev[0], prev[1] + mid[1] + nxt[1])]
+                i = max(i - 1, 1)
+            else:
+                i += 1
+
+        for speaker, run in runs:
+            starts = [w["start"] for w in run if w.get("start") is not None]
+            ends = [w["end"] for w in run if w.get("end") is not None]
+            out.append(
+                {
+                    "start": min(starts) if starts else None,
+                    "end": max(ends) if ends else None,
+                    "text": _join_chars([w["word"].strip() for w in run]),
+                    "speaker": speaker,
+                }
+            )
+    return out
 
 
 def build_segments(raw_segments: list[dict], converter) -> list[Segment]:
